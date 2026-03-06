@@ -45,58 +45,6 @@ services:
     environment:
       <<: *common-variables
     logging: *default-logging
-      target: production
-      args:
-        ENVIRONMENT: ${ENVIRONMENT:-production}
-        BUILD_DATE: ${BUILD_DATE}
-        VCS_REF: ${VCS_REF}
-        VERSION: ${VERSION:-1.0.0}
-      cache_from:
-        - ${REGISTRY:-docker.io}/app:latest
-        - ${REGISTRY:-docker.io}/app:${VERSION:-latest}
-    image: ${REGISTRY:-docker.io}/app:${VERSION:-latest}
-    container_name: production-app
-    restart: unless-stopped
-    ports:
-      - "${APP_PORT:-3000}:3000"
-    environment:
-      <<: *common-variables
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      REDIS_URL: redis://redis:6379/0
-      API_KEY: ${API_KEY}
-      JWT_SECRET: ${JWT_SECRET}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - frontend
-      - backend
-    volumes:
-      - app-logs:/app/logs:rw
-      - app-uploads:/app/uploads:rw
-    logging: *default-logging
-    healthcheck:
-      <<: *default-healthcheck
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
-    deploy:
-      <<: *default-resources
-      replicas: 2
-      update_config:
-        parallelism: 1
-        delay: 10s
-        order: start-first
-      rollback_config:
-        parallelism: 1
-        delay: 5s
-    labels:
-      - "com.example.service=app"
-      - "com.example.environment=${ENVIRONMENT:-production}"
-      - "com.example.version=${VERSION:-1.0.0}"
-      - "traefik.enable=true"
-      - "traefik.http.routers.app.rule=Host(`${DOMAIN}`)"
-      - "traefik.http.routers.app.tls=true"
 
   # PostgreSQL
   postgres:
