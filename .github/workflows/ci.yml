@@ -1,158 +1,411 @@
-# .github/workflows/production.yml
-name: Production CI/CD Pipeline
+# .gitlab-ci.yml
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  REGISTRY: $CI_REGISTRY
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  KUBE_NAMESPACE: production
+  ROLLOUT_RESOURCE_TYPE: deployment
 
-on:
-  push:
-    branches: [main, production]
-  pull_request:
-    branches: [main]
+# ========================================
+# Stages
+# ========================================
+stages:
+  - validate
+  - build
+  - test
+  - security
+  - package
+  - deploy-dev
+  - deploy-staging
+  - deploy-production
+  - post-deploy
+  - rollback
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+# ========================================
+# Templates
+# ========================================
+.docker-template: &docker-template
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER $CI_REGISTRY --password-stdin
 
-jobs:
-  # ========================================
-  # Lint & Format
-  # ========================================
-  lint:
-    name: Code Quality Checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-      
-      - name: Install dependencies
-        run: npm ci
-      
-      - name: Run ESLint
-        run: npm run lint
-      
-      - name: Run Prettier
-        run: npm run format:check
-      
-      - name: Lint Dockerfile
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: Dockerfile
+.kubectl-template: &kubectl-template
+  image: bitnami/kubectl:latest
+  before_script:
+    - kubectl config use-context $KUBE_CONTEXT
 
-  # ========================================
-  # Security Scan
-  # ========================================
-  security:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Run npm audit
-        run: npm audit --production
-        continue-on-error: true
-      
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          severity: 'CRITICAL,HIGH'
+.node-template: &node-template
+  image: node:20-alpine
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+      - .npm/
+  before_script:
+    - npm ci --cache .npm --prefer-offline
 
-  # ========================================
-  # Test
-  # ========================================
-  test:
-    name: Run Tests
-    runs-on: ubuntu-latest
-    needs: [lint]
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-      
-      - name: Install dependencies
-        run: npm ci
-      
-      - name: Run tests
-        run: npm test -- --coverage
-      
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
+# ========================================
+# STAGE 1: Validation
+# ========================================
+lint:dockerfile:
+  stage: validate
+  image: hadolint/hadolint:latest-alpine
+  script:
+    - hadolint Dockerfile
+  allow_failure: false
 
-  # ========================================
-  # Build & Push
-  # ========================================
-  build:
-    name: Build and Push Docker Image
-    runs-on: ubuntu-latest
-    needs: [lint, security, test]
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=sha,prefix={{branch}}-
-      
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
-            VCS_REF=${{ github.sha }}
-            VERSION=${{ github.ref_name }}
+lint:eslint:
+  <<: *node-template
+  stage: validate
+  script:
+    - npm run lint
+  artifacts:
+    reports:
+      junit: eslint-report.xml
 
-  # ========================================
-  # Deploy
-  # ========================================
-  deploy:
-    name: Deploy to Production
-    runs-on: ubuntu-latest
-    needs: [build]
-    if: github.ref == 'refs/heads/main'
-    environment: production
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Deploy to server
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.PRODUCTION_HOST }}
-          username: ${{ secrets.PRODUCTION_USER }}
-          key: ${{ secrets.PRODUCTION_SSH_KEY }}
-          script: |
-            cd /opt/app
-            docker-compose pull
-            docker-compose up -d
-            docker system prune -f
+lint:prettier:
+  <<: *node-template
+  stage: validate
+  script:
+    - npm run format:check
+
+type-check:
+  <<: *node-template
+  stage: validate
+  script:
+    - npm run type-check || tsc --noEmit
+
+# ========================================
+# STAGE 2: Build
+# ========================================
+build:docker:
+  <<: *docker-template
+  stage: build
+  script:
+    - |
+      docker build \
+        --build-arg BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ") \
+        --build-arg VCS_REF=$CI_COMMIT_SHA \
+        --build-arg VERSION=$CI_COMMIT_REF_NAME \
+        --cache-from $CI_REGISTRY_IMAGE:latest \
+        -t $IMAGE_TAG \
+        -t $CI_REGISTRY_IMAGE:latest \
+        .
+    - docker push $IMAGE_TAG
+    - docker push $CI_REGISTRY_IMAGE:latest
+  only:
+    - branches
+    - tags
+
+# ========================================
+# STAGE 3: Testing
+# ========================================
+test:unit:
+  <<: *node-template
+  stage: test
+  services:
+    - postgres:16-alpine
+    - redis:7-alpine
+  variables:
+    POSTGRES_DB: testdb
+    POSTGRES_USER: test
+    POSTGRES_PASSWORD: test
+    DATABASE_URL: postgresql://test:test@postgres:5432/testdb
+    REDIS_URL: redis://redis:6379
+  script:
+    - npm run test:unit -- --coverage
+  coverage: '/Lines\s*:\s*(\d+\.\d+)%/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+      junit: junit.xml
+    paths:
+      - coverage/
+
+test:integration:
+  <<: *node-template
+  stage: test
+  services:
+    - postgres:16-alpine
+    - redis:7-alpine
+  variables:
+    POSTGRES_DB: testdb
+    POSTGRES_USER: test
+    POSTGRES_PASSWORD: test
+    DATABASE_URL: postgresql://test:test@postgres:5432/testdb
+    REDIS_URL: redis://redis:6379
+  script:
+    - npm run test:integration
+  artifacts:
+    reports:
+      junit: integration-junit.xml
+
+test:e2e:
+  image: mcr.microsoft.com/playwright:v1.40.0
+  stage: test
+  services:
+    - postgres:16-alpine
+    - redis:7-alpine
+  variables:
+    POSTGRES_DB: testdb
+    POSTGRES_USER: test
+    POSTGRES_PASSWORD: test
+    DATABASE_URL: postgresql://test:test@postgres:5432/testdb
+    REDIS_URL: redis://redis:6379
+  script:
+    - npm ci
+    - npm run test:e2e
+  artifacts:
+    when: always
+    paths:
+      - playwright-report/
+    expire_in: 1 week
+
+# ========================================
+# STAGE 4: Security
+# ========================================
+security:npm-audit:
+  <<: *node-template
+  stage: security
+  script:
+    - npm audit --audit-level=moderate
+  allow_failure: true
+
+security:trivy-fs:
+  stage: security
+  image: aquasec/trivy:latest
+  script:
+    - trivy fs --exit-code 0 --severity HIGH,CRITICAL .
+    - trivy fs --exit-code 1 --severity CRITICAL .
+  allow_failure: true
+
+security:trivy-image:
+  stage: security
+  image: aquasec/trivy:latest
+  script:
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL $IMAGE_TAG
+    - trivy image --exit-code 1 --severity CRITICAL $IMAGE_TAG
+  dependencies:
+    - build:docker
+  allow_failure: true
+
+security:sbom:
+  stage: security
+  image: anchore/syft:latest
+  script:
+    - syft $IMAGE_TAG -o spdx-json > sbom.spdx.json
+  artifacts:
+    paths:
+      - sbom.spdx.json
+    expire_in: 30 days
+
+# ========================================
+# STAGE 5: Deploy Development
+# ========================================
+deploy:development:
+  <<: *kubectl-template
+  stage: deploy-dev
+  environment:
+    name: development
+    url: https://dev.example.com
+    on_stop: stop:development
+  script:
+    - kubectl set image deployment/app app=$IMAGE_TAG -n development
+    - kubectl rollout status deployment/app -n development --timeout=10m
+  only:
+    - develop
+
+stop:development:
+  <<: *kubectl-template
+  stage: deploy-dev
+  environment:
+    name: development
+    action: stop
+  script:
+    - kubectl scale deployment/app --replicas=0 -n development
+  when: manual
+  only:
+    - develop
+
+# ========================================
+# STAGE 6: Deploy Staging
+# ========================================
+deploy:staging:
+  <<: *kubectl-template
+  stage: deploy-staging
+  environment:
+    name: staging
+    url: https://staging.example.com
+  script:
+    - kubectl set image deployment/app app=$IMAGE_TAG -n staging
+    - kubectl rollout status deployment/app -n staging --timeout=10m
+    - |
+      # Smoke test
+      kubectl run smoke-test --rm -i --restart=Never \
+        --image=curlimages/curl:latest \
+        -- curl -f http://app-service.staging.svc.cluster.local/health
+  only:
+    - staging
+    - main
+
+# ========================================
+# STAGE 7: Deploy Production (Blue-Green)
+# ========================================
+deploy:production:blue-green:
+  <<: *kubectl-template
+  stage: deploy-production
+  environment:
+    name: production
+    url: https://example.com
+  variables:
+    DEPLOYMENT_STRATEGY: blue-green
+  script:
+    # Determine active/inactive environments
+    - |
+      ACTIVE=$(kubectl get service app-prod -n production -o jsonpath='{.spec.selector.version}')
+      if [ "$ACTIVE" == "blue" ]; then
+        INACTIVE="green"
+      else
+        INACTIVE="blue"
+      fi
+      echo "Active: $ACTIVE, Deploying to: $INACTIVE"
+    
+    # Deploy to inactive environment
+    - kubectl set image deployment/app-$INACTIVE app=$IMAGE_TAG -n production
+    - kubectl rollout status deployment/app-$INACTIVE -n production --timeout=10m
+    
+    # Health check
+    - |
+      for i in {1..10}; do
+        kubectl run health-check --rm -i --restart=Never \
+          --image=curlimages/curl:latest \
+          -- curl -f http://app-$INACTIVE-service.production.svc.cluster.local/health && break
+        sleep 10
+      done
+    
+    # Switch traffic
+    - kubectl patch service app-prod -n production -p "{\"spec\":{\"selector\":{\"version\":\"$INACTIVE\"}}}"
+    
+    # Monitor
+    - sleep 60
+    
+    # Scale down old version
+    - kubectl scale deployment/app-$ACTIVE --replicas=1 -n production
+  when: manual
+  only:
+    - main
+
+# ========================================
+# STAGE 8: Deploy Production (Canary)
+# ========================================
+deploy:production:canary-10:
+  <<: *kubectl-template
+  stage: deploy-production
+  environment:
+    name: production-canary
+    url: https://example.com
+  script:
+    - kubectl apply -f k8s/canary-deployment.yaml
+    - kubectl set image deployment/app-canary app=$IMAGE_TAG -n production
+    - |
+      PROD_REPLICAS=$(kubectl get deployment app-prod -n production -o jsonpath='{.spec.replicas}')
+      CANARY_REPLICAS=$(( PROD_REPLICAS / 10 ))
+      kubectl scale deployment/app-canary --replicas=$CANARY_REPLICAS -n production
+    - echo "Canary deployed with 10% traffic"
+  when: manual
+  only:
+    - main
+
+deploy:production:canary-50:
+  <<: *kubectl-template
+  stage: deploy-production
+  environment:
+    name: production-canary
+  script:
+    - |
+      PROD_REPLICAS=$(kubectl get deployment app-prod -n production -o jsonpath='{.spec.replicas}')
+      CANARY_REPLICAS=$(( PROD_REPLICAS / 2 ))
+      kubectl scale deployment/app-canary --replicas=$CANARY_REPLICAS -n production
+    - echo "Canary scaled to 50% traffic"
+  when: manual
+  needs: [deploy:production:canary-10]
+  only:
+    - main
+
+deploy:production:canary-promote:
+  <<: *kubectl-template
+  stage: deploy-production
+  environment:
+    name: production
+    url: https://example.com
+  script:
+    - kubectl set image deployment/app-prod app=$IMAGE_TAG -n production
+    - kubectl rollout status deployment/app-prod -n production
+    - kubectl delete deployment app-canary -n production
+    - echo "Canary promoted to production"
+  when: manual
+  needs: [deploy:production:canary-50]
+  only:
+    - main
+
+# ========================================
+# STAGE 9: Post-Deployment
+# ========================================
+post-deploy:migrations:
+  <<: *kubectl-template
+  stage: post-deploy
+  script:
+    - |
+      kubectl run migrations --rm -i --restart=Never \
+        --image=$IMAGE_TAG \
+        -- npm run migrate
+  when: manual
+  only:
+    - main
+
+post-deploy:notification:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - |
+      curl -X POST $SLACK_WEBHOOK_URL \
+        -H 'Content-Type: application/json' \
+        -d '{
+          "text": "✅ Production deployment completed",
+          "attachments": [{
+            "color": "good",
+            "fields": [
+              {"title": "Version", "value": "'$CI_COMMIT_SHA'", "short": true},
+              {"title": "Branch", "value": "'$CI_COMMIT_REF_NAME'", "short": true},
+              {"title": "Pipeline", "value": "'$CI_PIPELINE_URL'", "short": false}
+            ]
+          }]
+        }'
+  only:
+    - main
+
+# ========================================
+# STAGE 10: Rollback
+# ========================================
+rollback:production:
+  <<: *kubectl-template
+  stage: rollback
+  environment:
+    name: production
+  script:
+    - kubectl rollout undo deployment/app-prod -n production
+    - kubectl rollout status deployment/app-prod -n production
+    - |
+      curl -X POST $SLACK_WEBHOOK_URL \
+        -H 'Content-Type: application/json' \
+        -d '{"text": "⚠️ Production rollback initiated by '$CI_COMMIT_AUTHOR'"}'
+  when: manual
+  only:
+    - main
