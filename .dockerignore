@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+bower_components/
+vendor/
+
+# Build artifacts
+dist/
+build/
+.next/
+out/
+coverage/
+
+# Development files
+.git/
+.github/
+.vscode/
+.idea/
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# Test files
+tests/
+test/
+__tests__/
+*.test.js
+*.spec.js
+
+# Documentation
+docs/
+*.md
+README.md
+
+# CI/CD
+.gitlab-ci.yml
+.travis.yml
+Jenkinsfile
+
+# Environment
+.env*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
